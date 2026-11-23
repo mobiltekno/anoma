@@ -5,7 +5,7 @@
 
 Bu klasör kanal konseptini ve **çalışan bir prototipi** içerir. Prototip, sahte istatistiklerle simüle edilmiş 7 günden 7 dikey Shorts videosu üretir.
 
-- Önizleme videosu: [`preview/week.mp4`](preview/week.mp4)
+- Önizleme videosu (sesli, dönen 3D gezegen, 720x1280): [`preview/week.mp4`](preview/week.mp4)
 - 7 günün son kareleri: [`preview/sheet.png`](preview/sheet.png)
 - Günlük olay kaydı: [`preview/log.md`](preview/log.md)
 
@@ -97,8 +97,8 @@ python3 run_demo.py
 ## 9. Yol haritası
 
 - [x] Dünya motoru + günlük render (prototip)
-- [ ] Ses: prosedürel efektler (çarpma, yeni ülke, temas) + telifsiz müzik
-- [ ] Daha canlı görsel: gezegenin dönme efekti, atmosfer, gece-gündüz
+- [x] Ses: prosedürel ambiyans + olay efektleri (pop, çan, alarm, çarpma)
+- [x] Dönen 3D gezegen: ışık, bulutlar, atmosfer, gece tarafında şehir ışıkları, asteroit efekti
 - [ ] `youtube_stats.py`: YouTube Data API ile dünkü videonun izlenme, beğeni ve yorumları; yazar başına tek oy
 - [ ] Durum kalıcılığı: `state.json` (dünya her gün kaldığı yerden devam eder)
 - [ ] Haftalık özet videosu üreticisi (16:9, anlatım metni + grafikler)
