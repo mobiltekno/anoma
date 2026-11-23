@@ -12,6 +12,9 @@ One planet, shared by everyone who watches. Each day the previous video's number
 
 Nations never attack each other. They race for empty land and only survive
 threats together - competition and cooperation at the same time.
+
+The map is equirectangular (width = 2 x height) and wraps east-west, so it can be
+wrapped around a rotating sphere. The polar caps are ice and cannot be settled.
 """
 from __future__ import annotations
 
@@ -22,6 +25,10 @@ import random
 import re
 from dataclasses import dataclass, field
 
+import numpy as np
+
+from .noise import fractal
+
 FLAG_RE = re.compile("[\U0001F1E6-\U0001F1FF]{2}")
 BLOCKED_WORDS = {"fuck", "shit", "nazi", "kill"}  # placeholder; real list goes in config
 
@@ -30,6 +37,10 @@ THREATS = {
     "plague": "PLAGUE",
     "ice_age": "ICE AGE",
 }
+
+TEX_SCALE = 6          # texture pixels per tile (render detail)
+SEA_LEVEL = 0.53
+POLAR_ROWS = 0.09      # fraction of rows at each pole that are ice
 
 
 def flags_in(text: str) -> list[str]:
@@ -43,7 +54,7 @@ def flags_in(text: str) -> list[str]:
 
 def nation_color(code: str) -> tuple[int, int, int]:
     h = int(hashlib.sha1(code.encode()).hexdigest()[:6], 16) / 0xFFFFFF
-    r, g, b = colorsys.hsv_to_rgb(h, 0.65, 0.95)
+    r, g, b = colorsys.hsv_to_rgb(h, 0.75, 1.0)
     return int(r * 255), int(g * 255), int(b * 255)
 
 
@@ -70,63 +81,71 @@ class DayResult:
     day: int
     new_tiles: list            # [(x, y, code)] in the order they were claimed
     destroyed: list            # [(x, y)] tiles lost to a threat
+    impact_at: tuple | None    # (x, y) centre of the impact, if any
     events: list               # human-readable headlines
+    kinds: list                # one tag per headline: nation|contact|monument|warning|saved|hit|death
     votes: dict                # code -> votes today
     threat_resolved: str | None  # "saved" | "hit" | None
 
 
 class World:
-    def __init__(self, size: int = 96, seed: int = 7):
-        self.size = size
+    def __init__(self, height: int = 80, seed: int = 7):
+        self.h, self.w = height, height * 2
         self.rng = random.Random(seed)
+        self.seed = seed
         self.day = 0
         self.health = 60.0
         self.alive = True
         self.nations: dict[str, Nation] = {}
         self.monuments: list[tuple[int, int, str, int]] = []
         self.threat: dict | None = None
-        c = (size - 1) / 2
-        self.land = [[(x - c) ** 2 + (y - c) ** 2 <= (c - 1) ** 2 for x in range(size)] for y in range(size)]
-        self._carve_lakes(6)
-        self.owner: list[list[str | None]] = [[None] * size for _ in range(size)]
-        self.crater = [[False] * size for _ in range(size)]
+        # terrain lives at texture resolution; the simulation samples it per tile
+        self.elevation = fractal(self.h * TEX_SCALE, self.w * TEX_SCALE, seed, octaves=7, base=3)
+        centres = self.elevation[TEX_SCALE // 2::TEX_SCALE, TEX_SCALE // 2::TEX_SCALE]
+        polar = int(self.h * POLAR_ROWS)
+        self.land = [[bool(centres[y, x] > SEA_LEVEL) and polar <= y < self.h - polar
+                      for x in range(self.w)] for y in range(self.h)]
+        self.owner: list[list[str | None]] = [[None] * self.w for _ in range(self.h)]
+        self.crater = [[False] * self.w for _ in range(self.h)]
 
     # ---------- geometry helpers ----------
-    def _carve_lakes(self, n: int) -> None:
-        for _ in range(n):
-            cx, cy = self.rng.randrange(self.size), self.rng.randrange(self.size)
-            r = self.rng.randint(3, 7)
-            for y in range(max(0, cy - r), min(self.size, cy + r + 1)):
-                for x in range(max(0, cx - r), min(self.size, cx + r + 1)):
-                    if (x - cx) ** 2 + (y - cy) ** 2 <= r * r:
-                        self.land[y][x] = False
+    def cells(self):
+        for y in range(self.h):
+            for x in range(self.w):
+                yield x, y
 
     def _neighbors(self, x: int, y: int):
         for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-            nx, ny = x + dx, y + dy
-            if 0 <= nx < self.size and 0 <= ny < self.size:
-                yield nx, ny
+            ny = y + dy
+            if 0 <= ny < self.h:
+                yield (x + dx) % self.w, ny
+
+    def _dist2(self, a, b) -> float:
+        dx = abs(a[0] - b[0])
+        dx = min(dx, self.w - dx)
+        return dx * dx + (a[1] - b[1]) ** 2
 
     def _free(self, x: int, y: int) -> bool:
         return self.land[y][x] and not self.crater[y][x] and self.owner[y][x] is None
 
     def free_tiles(self) -> int:
-        return sum(self._free(x, y) for y in range(self.size) for x in range(self.size))
+        return sum(self._free(x, y) for x, y in self.cells())
 
     def _spawn_point(self) -> tuple[int, int] | None:
-        cand = [(x, y) for y in range(self.size) for x in range(self.size) if self._free(x, y)]
+        cand = [(x, y) for x, y in self.cells() if self._free(x, y)]
         if not cand:
             return None
         # prefer spots far from other nations so everyone gets a fair start
-        owned = [(x, y) for y in range(self.size) for x in range(self.size) if self.owner[y][x]]
+        owned = [(x, y) for x, y in self.cells() if self.owner[y][x]]
         if not owned:
             return self.rng.choice(cand)
+        ref = owned[::7] or owned
         sample = self.rng.sample(cand, min(200, len(cand)))
-        return max(sample, key=lambda p: min((p[0] - o[0]) ** 2 + (p[1] - o[1]) ** 2 for o in owned[::7] or owned))
+        return max(sample, key=lambda p: min(self._dist2(p, o) for o in ref))
 
     def _grow(self, code: str, amount: int) -> list:
         claimed = []
-        frontier = [(x, y) for y in range(self.size) for x in range(self.size)
+        frontier = [(x, y) for x, y in self.cells()
                     if self.owner[y][x] == code and any(self._free(nx, ny) for nx, ny in self._neighbors(x, y))]
         while amount > 0 and frontier:
             x, y = frontier.pop(self.rng.randrange(len(frontier)))
@@ -143,13 +162,15 @@ class World:
         self.nations[code].tiles += len(claimed)
         return claimed
 
-    def _impact(self, radius: int) -> list:
-        owned = [(x, y) for y in range(self.size) for x in range(self.size) if self.owner[y][x]]
-        cx, cy = self.rng.choice(owned) if owned else (self.size // 2, self.size // 2)
+    def _impact(self, radius: int) -> tuple[list, tuple]:
+        mid = [(x, y) for x, y in self.cells() if self.owner[y][x] and 0.25 * self.h <= y <= 0.75 * self.h]
+        owned = mid or [(x, y) for x, y in self.cells() if self.owner[y][x]]
+        cx, cy = self.rng.choice(owned) if owned else (self.w // 2, self.h // 2)
         lost = []
-        for y in range(max(0, cy - radius), min(self.size, cy + radius + 1)):
-            for x in range(max(0, cx - radius), min(self.size, cx + radius + 1)):
-                if self.land[y][x] and (x - cx) ** 2 + (y - cy) ** 2 <= radius * radius:
+        for y in range(max(0, cy - radius), min(self.h, cy + radius + 1)):
+            for xx in range(cx - radius, cx + radius + 1):
+                x = xx % self.w
+                if self.land[y][x] and (xx - cx) ** 2 + (y - cy) ** 2 <= radius * radius:
                     code = self.owner[y][x]
                     if code:
                         self.nations[code].tiles -= 1
@@ -157,7 +178,12 @@ class World:
                     self.crater[y][x] = True
                     lost.append((x, y))
         self.monuments = [m for m in self.monuments if not self.crater[m[1]][m[0]]]
-        return lost
+        return lost, (cx, cy)
+
+    def owner_grid(self) -> np.ndarray:
+        """(h, w) int array: -1 = none, else index into sorted(self.nations)."""
+        idx = {c: i for i, c in enumerate(sorted(self.nations))}
+        return np.array([[idx.get(o, -1) if o else -1 for o in row] for row in self.owner], np.int16)
 
     # ---------- the daily tick ----------
     def step(self, views: int, likes: int, comments: list[dict], force_threat: str | None = None) -> DayResult:
@@ -165,7 +191,11 @@ class World:
         if not self.alive:
             raise RuntimeError("the planet is dead")
         self.day += 1
-        events, destroyed, new_tiles, resolved = [], [], [], None
+        events, kinds, destroyed, new_tiles, resolved, impact_at = [], [], [], [], None, None
+
+        def say(kind: str, text: str):
+            kinds.append(kind)
+            events.append(text)
 
         # 1) settle yesterday's threat
         if self.threat:
@@ -173,12 +203,13 @@ class World:
             if len(comments) >= t["need"]:
                 resolved = "saved"
                 self.health = min(100.0, self.health + 10)
-                events.append(f"{THREATS[t['kind']]} STOPPED - {len(comments):,}/{t['need']:,} comments")
+                say("saved", f"{THREATS[t['kind']]} STOPPED - {len(comments):,}/{t['need']:,} comments")
             else:
                 resolved = "hit"
-                destroyed = self._impact(radius=t["radius"])
+                destroyed, impact_at = self._impact(radius=t["radius"])
                 self.health -= 20
-                events.append(f"{THREATS[t['kind']]} HIT - only {len(comments):,}/{t['need']:,}. {len(destroyed)} km² lost")
+                say("hit", f"{THREATS[t['kind']]} HIT - only {len(comments):,}/{t['need']:,}. "
+                           f"{len(destroyed)} km² lost")
             self.threat = None
 
         # 2) health: likes heal, time hurts
@@ -206,27 +237,25 @@ class World:
             n.votes_total += votes[code]
             trade = 1 + 0.1 * len(n.contacts)
             new_tiles += self._grow(code, round(sunlight * trade * (3 + 6 * math.sqrt(votes[code]))))
-
         if arrivals:
-            events.append(f"NEW NATION: {arrivals[0]} landed on the planet" if len(arrivals) == 1 else
-                          f"{len(arrivals)} NEW NATIONS LANDED: {', '.join(arrivals[:8])}{'...' if len(arrivals) > 8 else ''}")
+            say("nation", f"NEW NATION: {arrivals[0]} landed on the planet" if len(arrivals) == 1 else
+                f"{len(arrivals)} NEW NATIONS LANDED: {', '.join(arrivals[:8])}{'...' if len(arrivals) > 8 else ''}")
 
         # 4) first contacts open trade routes (growth bonus for both)
         pairs: list[str] = []
-        for y in range(self.size):
-            for x in range(self.size):
-                a = self.owner[y][x]
-                if not a:
-                    continue
-                for nx, ny in self._neighbors(x, y):
-                    b = self.owner[ny][nx]
-                    if b and b != a and b not in self.nations[a].contacts:
-                        self.nations[a].contacts.add(b)
-                        self.nations[b].contacts.add(a)
-                        pairs.append(f"{a}+{b}")
+        for x, y in self.cells():
+            a = self.owner[y][x]
+            if not a:
+                continue
+            for nx, ny in self._neighbors(x, y):
+                b = self.owner[ny][nx]
+                if b and b != a and b not in self.nations[a].contacts:
+                    self.nations[a].contacts.add(b)
+                    self.nations[b].contacts.add(a)
+                    pairs.append(f"{a}+{b}")
         if pairs:
-            events.append(f"FIRST CONTACT: {pairs[0]} opened a trade route" if len(pairs) == 1 else
-                          f"{len(pairs)} TRADE ROUTES OPENED: {', '.join(pairs[:5])}{'...' if len(pairs) > 5 else ''}")
+            say("contact", f"FIRST CONTACT: {pairs[0]} opened a trade route" if len(pairs) == 1 else
+                f"{len(pairs)} TRADE ROUTES OPENED: {', '.join(pairs[:5])}{'...' if len(pairs) > 5 else ''}")
 
         # 5) the most-liked comment becomes a monument
         ranked = sorted(comments, key=lambda c: c.get("likes", 0), reverse=True)
@@ -235,26 +264,25 @@ class World:
             if not text:
                 continue
             home = next((f for f in flags_in(c["text"]) if f in self.nations), None)
-            spots = [(x, y) for y in range(self.size) for x in range(self.size)
-                     if self.owner[y][x] == home] if home else []
+            spots = [(x, y) for x, y in self.cells() if self.owner[y][x] == home] if home else []
             if spots:
                 x, y = self.rng.choice(spots)
                 self.monuments.append((x, y, text, self.day))
-                events.append(f'MONUMENT: "{text}"')
+                say("monument", f'MONUMENT: "{text}"')
             break
 
         # 6) maybe announce a new threat for tomorrow
         if force_threat or (self.day >= 3 and self.rng.random() < 0.25):
             kind = force_threat or self.rng.choice(list(THREATS))
             need = int(len(comments) * 1.5) + 20
-            self.threat = {"kind": kind, "need": need, "radius": 14}
-            events.append(f"WARNING: {THREATS[kind]} in 24h - need {need:,} comments to survive")
+            self.threat = {"kind": kind, "need": need, "radius": 11}
+            say("warning", f"WARNING: {THREATS[kind]} in 24h - need {need:,} comments to survive")
 
         if self.health <= 0:
             self.alive = False
-            events.append("THE PLANET HAS DIED")
+            say("death", "THE PLANET HAS DIED")
 
-        return DayResult(self.day, new_tiles, destroyed, events, votes, resolved)
+        return DayResult(self.day, new_tiles, destroyed, impact_at, events, kinds, votes, resolved)
 
     def leaderboard(self, n: int = 5) -> list[Nation]:
         return sorted(self.nations.values(), key=lambda k: k.tiles, reverse=True)[:n]
