@@ -90,7 +90,7 @@ planet-of-us/
 Gereksinimler: Python 3.10+, Pillow, ffmpeg. Başka paket yok.
 
 ```bash
-cd planet-of-us
+cd Blockornim/planet-of-us
 python3 run_demo.py
 ```
 
